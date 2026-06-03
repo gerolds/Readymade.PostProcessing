@@ -1,5 +1,7 @@
 # Volumetric Fog
 
+![preview](preview.jpg)
+
 A drop-in URP render feature that fills the camera frustum with a **froxel-based participating medium** —
 a near-field fog for **enclosed, sunless spaces** (caves, interiors, dust). It is built so that **local
 scene lights carve shafts through the fog**, and — the headline guarantee — **geometry blocks scatter
