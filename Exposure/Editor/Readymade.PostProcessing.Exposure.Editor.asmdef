@@ -1,0 +1,20 @@
+{
+    "name": "Readymade.PostProcessing.Exposure.Editor",
+    "rootNamespace": "Readymade.PostProcessing.Editor",
+    "references": [
+        "Readymade.PostProcessing.Exposure",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.RenderPipelines.Universal.Runtime"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

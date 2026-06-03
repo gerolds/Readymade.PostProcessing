@@ -1,0 +1,253 @@
+// ADR: Two-kernel froxel fog. Populate evaluates lighting at the jittered slice and reprojects against history — so per-froxel blue-noise z-jitter + temporal accumulation dissolve slice/shadow banding (the reason lighting lives here, not in Integrate). Integrate marches each column front-to-back into (accumulated in-scatter, transmittance).
+// ADR: World reconstruction is matrix-driven (invViewProj from C#) so it matches URP's own uv->world; scatter stores in-scattered radiance (rgb=albedo*light, a=sigma_e) — the energy-correct slice integral is radiance*(1-T), no division.
+// ADR: Sun read as explicit constant. Local lights (P1') read URP's GLOBAL _AdditionalLights* arrays directly from the dispatch — confirmed: per-frame light globals DO bind to a compute pass (RealtimeLights.hlsl:47/62 attenuation replicated, not included).
+// ADR: Geometry occlusion (the non-negotiable) gates each local light by URP's additional-light shadow atlas — _AdditionalShadowParams/_AdditionalLightsWorldToShadow bind by name (SetGlobalVector/MatrixArray), atlas bound explicitly per dispatch; AdditionalLightRealtimeShadow (Shadows.hlsl:396) replicated, not included.
+#pragma kernel Populate
+#pragma kernel Integrate
+#pragma multi_compile _ _FOG_LOCAL_LIGHTS
+#pragma multi_compile _ _FOG_LOCAL_SHADOWS
+
+#define FOG_PI 3.14159265359
+#define FOG_MAX_LIGHTS 256 // URP MAX_VISIBLE_LIGHT_COUNT_DESKTOP; spike — revisit for SSBO/mobile layouts
+
+// View / froxel layout
+float4x4 _FogInvViewProj;     // inverse(GPU viewProj) this frame
+float4x4 _FogPrevViewProj;    // GPU viewProj last frame (for reprojection)
+float4   _FogCamPosWS;         // xyz
+float4   _FogCamFwdWS;         // xyz (unit, Unity world forward)
+float4   _FogPrevCamPosWS;     // xyz
+float4   _FogPrevCamFwdWS;     // xyz (unit)
+float4   _FogGridSize;         // (X, Y, Z, _)
+float4   _FogDepthParams;      // (near, far, sliceExponent k, _)
+
+// Tunables
+float4 _FogAlbedo;        // rgb scattering tint
+float4 _FogAmbient;       // rgb ambient in-scatter
+float4 _FogMainLightColor;// rgb (intensity-scaled, linear)
+float4 _FogMainLightDirWS;// xyz direction TOWARD the light
+float4 _FogScatterParams; // (density, heightStart, heightFalloff, sun anisotropy g)
+float4 _FogLightParams;   // (lightIntensityScale, historyBlend, zJitter, localLightIntensity)
+float4 _FogLocalParams;   // (local-light anisotropy g, source radius², _, _)
+
+RWTexture3D<float4> _FogScatterWrite;   // Populate out (this frame)
+Texture3D<float4>   _FogScatterHistory; // last frame (sampled, reprojected)
+Texture3D<float4>   _FogScatterRead;    // this frame's scatter (Integrate in)
+RWTexture3D<float4> _FogIntegrated;      // Integrate out
+
+SamplerState sampler_LinearClamp;
+
+// World ray direction through froxel-column uv. Convention-robust: all depths on a
+// perspective ray unproject to the same direction, so the chosen device depth is arbitrary.
+float3 FogRayDir(float2 uv)
+{
+    float4 clip = float4(uv * 2.0 - 1.0, 0.5, 1.0);
+    float4 ws = mul(_FogInvViewProj, clip);
+    ws.xyz /= ws.w;
+    return normalize(ws.xyz - _FogCamPosWS.xyz);
+}
+
+// Perpendicular (along-forward) eye depth for a normalized slice coordinate.
+float SliceDepth(float slice01)
+{
+    return _FogDepthParams.x + (_FogDepthParams.y - _FogDepthParams.x) * pow(slice01, _FogDepthParams.z);
+}
+
+float HenyeyGreenstein(float cosT, float g)
+{
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cosT;
+    return (1.0 - g2) / (4.0 * FOG_PI * pow(max(denom, 1e-4), 1.5));
+}
+
+#if defined(_FOG_LOCAL_LIGHTS)
+// URP's per-frame global additional-light arrays (Input.hlsl:128/168-172). Read
+// straight from the dispatch — no per-object index (unity_LightData absent in
+// compute), no Forward+ cluster. Brute-force over all visible additional lights.
+half4   _AdditionalLightsCount;
+float4  _AdditionalLightsPosition[FOG_MAX_LIGHTS];
+half4   _AdditionalLightsColor[FOG_MAX_LIGHTS];
+half4   _AdditionalLightsAttenuation[FOG_MAX_LIGHTS];
+half4   _AdditionalLightsSpotDir[FOG_MAX_LIGHTS];
+
+#if defined(_FOG_LOCAL_SHADOWS)
+// URP's additional-light shadow atlas + per-light slice transforms. Same name-bind
+// path as the light arrays (Shadows.hlsl:64/98/99). sampler_LinearClampCompare is an
+// inline comparison sampler recognised by name; atlas is bound explicitly per dispatch.
+Texture2D              _AdditionalLightsShadowmapTexture;
+SamplerComparisonState sampler_LinearClampCompare;
+float4                 _AdditionalShadowParams[FOG_MAX_LIGHTS];      // x:strength y:soft z:isPoint w:firstSlice(-1=none)
+float4x4               _AdditionalLightsWorldToShadow[FOG_MAX_LIGHTS];
+
+float FogCubeMapFaceID(float3 dir) // Common.hlsl:587, faces 0..5 = +X -X +Y -Y +Z -Z
+{
+    float faceID; // single-exit: early returns trip the Metal cross-compiler's init analysis
+    if (abs(dir.z) >= abs(dir.x) && abs(dir.z) >= abs(dir.y))
+        faceID = (dir.z < 0.0) ? 5.0 : 4.0;
+    else if (abs(dir.y) >= abs(dir.x))
+        faceID = (dir.y < 0.0) ? 3.0 : 2.0;
+    else
+        faceID = (dir.x < 0.0) ? 1.0 : 0.0;
+    return faceID;
+}
+
+// Visibility [0,1] of a froxel from additional light i — the geometry gate. L is the
+// froxel->light direction, so -L (light->froxel) selects the point-light cube face.
+float FogAdditionalShadow(int i, float3 worldPos, float3 L)
+{
+    float vis = 1.0; // default lit: no shadow caster, or outside the light frustum
+    float4 sp = _AdditionalShadowParams[i]; // x:strength y:soft z:isPoint w:firstSlice
+    int slice = (int) sp.w;
+    if (slice >= 0)
+    {
+        if (sp.z > 0.5)
+            slice += (int) FogCubeMapFaceID(-L);
+        float4 sc = mul(_AdditionalLightsWorldToShadow[slice], float4(worldPos, 1.0));
+        sc.xyz /= sc.w; // spot & point shadow projections are perspective
+        if (sc.z > 0.0 && sc.z < 1.0) // inside the frustum; else BEYOND_SHADOW_FAR => lit
+        {
+            float lit = _AdditionalLightsShadowmapTexture.SampleCmpLevelZero(sampler_LinearClampCompare, sc.xy, sc.z);
+            vis = lerp(1.0, lit, sp.x); // LerpWhiteTo by shadow strength
+        }
+    }
+    return vis;
+}
+#else
+float FogAdditionalShadow(int i, float3 worldPos, float3 L) { return 1.0; }
+#endif
+
+// In-scatter from local point/spot lights at a froxel, gated by the shadow atlas so
+// geometry between light and froxel blocks the contribution (no glow through walls).
+float3 FogLocalLightInscatter(float3 worldPos, float3 rayDir, float g, float intensity, float radiusSqr)
+{
+    float3 sum = 0.0;
+    int count = min((int) _AdditionalLightsCount.x, FOG_MAX_LIGHTS);
+    [loop]
+    for (int i = 0; i < count; i++)
+    {
+        float4 posW = _AdditionalLightsPosition[i];
+        float3 toLight = posW.xyz - worldPos * posW.w; // w=1 punctual, w=0 directional (xyz already a dir)
+        float distSqr = max(dot(toLight, toLight), 1e-4);
+        float3 L = toLight * rsqrt(distSqr);
+
+        half4 atten = _AdditionalLightsAttenuation[i]; // xy: distance, zw: spot angle
+        // Finite-radius (area-light) inverse square: peak bounded to 1/radiusSqr at the source
+        // instead of the 1e-4 clamp's ~10000 spike, so near-source fog stops aliasing the dither
+        // into a visible pattern. distSqr itself stays true for direction + the range window.
+        float lightAtten = rcp(distSqr + radiusSqr);
+        float factor = distSqr * atten.x;
+        float sf = saturate(1.0 - factor * factor);
+        float distanceAtten = lightAtten * (sf * sf);
+
+        float sdotl = dot(_AdditionalLightsSpotDir[i].xyz, L);
+        float a = saturate(sdotl * atten.z + atten.w);
+        float spotAtten = a * a;
+
+        float phase = HenyeyGreenstein(dot(rayDir, L), g);
+        float vis = FogAdditionalShadow(i, worldPos, L);
+        sum += _AdditionalLightsColor[i].rgb * (distanceAtten * spotAtten * phase * intensity * vis);
+    }
+    return sum;
+}
+#endif
+
+// Interleaved gradient noise (Jimenez 2014) — spectrally near blue noise, texture-free.
+// Decorrelates neighbouring froxel columns so residual banding reads as fine high-frequency
+// noise the temporal accumulator removes, instead of coherent slabs that shimmer.
+float FogIGN(float2 p)
+{
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+[numthreads(8, 8, 1)]
+void Populate(uint3 id : SV_DispatchThreadID)
+{
+    int3 g = (int3) _FogGridSize.xyz;
+    if (id.x >= (uint) g.x || id.y >= (uint) g.y || id.z >= (uint) g.z)
+        return;
+
+    float2 uv = (float2(id.xy) + 0.5) / _FogGridSize.xy;
+    float3 rayDir = FogRayDir(uv);
+    float cosT = max(dot(rayDir, _FogCamFwdWS.xyz), 1e-4);
+
+    float near = _FogDepthParams.x;
+    float far = _FogDepthParams.y;
+    float k = _FogDepthParams.z;
+
+    // Per-froxel blue-noise z-jitter. FogIGN decorrelates neighbouring columns (no coherent
+    // slab that shimmers when the whole volume shifts), and the golden-ratio temporal phase in
+    // _FogLightParams.z animates it for low-variance history convergence. 0 phase => static dither.
+    float jitter = frac(FogIGN(float2(id.xy)) + _FogLightParams.z);
+    float slice01 = (float(id.z) + jitter) / _FogGridSize.z;
+    float d = SliceDepth(slice01);
+    float3 worldPos = _FogCamPosWS.xyz + rayDir * (d / cosT);
+
+    float ext = _FogScatterParams.x * exp(-_FogScatterParams.z * max(0.0, worldPos.y - _FogScatterParams.y));
+
+    // Lighting is evaluated HERE, at the jittered slice — so the per-frame z-jitter and
+    // history reprojection below dissolve slice/shadow banding. Store in-scattered
+    // radiance (albedo*light); Integrate is then a pure transmittance march.
+    float cosLight = dot(rayDir, _FogMainLightDirWS.xyz);
+    float phase = HenyeyGreenstein(cosLight, _FogScatterParams.w);
+    float3 lightField = _FogMainLightColor.rgb * (_FogLightParams.x * phase) + _FogAmbient.rgb;
+#if defined(_FOG_LOCAL_LIGHTS)
+    lightField += FogLocalLightInscatter(worldPos, rayDir, _FogLocalParams.x, _FogLightParams.w, _FogLocalParams.y);
+#endif
+    float4 cur = float4(_FogAlbedo.rgb * lightField, ext);
+
+    float blend = _FogLightParams.y; // 1 => ignore history (first frame / reset / temporal off)
+    if (blend < 0.999)
+    {
+        float4 pc = mul(_FogPrevViewProj, float4(worldPos, 1.0));
+        if (pc.w > 1e-5)
+        {
+            float2 pUV = (pc.xy / pc.w) * 0.5 + 0.5;
+            float pd = dot(worldPos - _FogPrevCamPosWS.xyz, _FogPrevCamFwdWS.xyz);
+            float pSlice01 = pow(saturate((pd - near) / max(far - near, 1e-4)), 1.0 / k);
+            bool valid = all(pUV >= 0.0) && all(pUV <= 1.0) && pd >= near && pd <= far;
+            if (valid)
+            {
+                float4 hist = _FogScatterHistory.SampleLevel(sampler_LinearClamp, float3(pUV, pSlice01), 0);
+                cur = lerp(hist, cur, blend);
+            }
+        }
+    }
+
+    _FogScatterWrite[id] = cur;
+}
+
+[numthreads(8, 8, 1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    int3 g = (int3) _FogGridSize.xyz;
+    if (id.x >= (uint) g.x || id.y >= (uint) g.y)
+        return;
+
+    float2 uv = (float2(id.xy) + 0.5) / _FogGridSize.xy;
+    float3 rayDir = FogRayDir(uv);
+    float cosT = max(dot(rayDir, _FogCamFwdWS.xyz), 1e-4);
+
+    // Pure transmittance march. Lighting (sun + local + occlusion) was already folded
+    // into s.rgb (in-scattered radiance) by Populate, at the jittered/accumulated slice.
+    float Z = _FogGridSize.z;
+    float3 accumInscatter = 0.0;
+    float accumTransmittance = 1.0;
+
+    [loop]
+    for (int z = 0; z < g.z; z++)
+    {
+        float4 s = _FogScatterRead.Load(int4((int) id.x, (int) id.y, z, 0));
+        float sigma = s.a;
+
+        float d0 = SliceDepth(float(z) / Z);
+        float d1 = SliceDepth(float(z + 1) / Z);
+        float pathLen = max(d1 - d0, 0.0) / cosT;
+
+        float Ts = exp(-sigma * pathLen);
+
+        float3 S = s.rgb * (1.0 - Ts); // radiance*(1-T): energy-correct slice integral
+        accumInscatter += accumTransmittance * S;
+        accumTransmittance *= Ts;
+
+        _FogIntegrated[uint3(id.x, id.y, (uint) z)] = float4(accumInscatter, accumTransmittance);
+    }
+}

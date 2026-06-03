@@ -1,0 +1,25 @@
+{
+    "name": "com.readymade.postprocessing",
+    "version": "0.0.1",
+    "displayName": "Readymade PostProcessing",
+    "description": "A collection of UPR PostProcessing effects.",
+    "unity": "6000.4",
+    "unityRelease": "0f1",
+    "documentationUrl": "https://github.com/gerolds/Readymade.PostProcessing",
+    "changelogUrl": "https://github.com/gerolds/Readymade.PostProcessing/CHANGELOG.md",
+    "licensesUrl": "https://github.com/gerolds/Readymade.PostProcessing/LICENSE",
+    "dependencies": {
+        "com.unity.render-pipelines.universal": "17.4.0",
+        "com.unity.mathematics": "1.3.3",
+        "com.unity.burst": "1.8.29",
+        "com.unity.collections": "6.4.0"
+    },
+    "keywords": [
+        "urp",
+        "postprocessing"
+    ],
+    "author": {
+        "name": "Gerold Schneider",
+        "url": "https://github.com/gerolds"
+    }
+}

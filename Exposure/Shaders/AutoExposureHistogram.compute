@@ -1,0 +1,118 @@
+// ADR: Log2/EV bins; center-weighted scatter via groupshared InterlockedAdd; percentile-window reduction; GPU-only temporal adapt.
+#pragma kernel KClear
+#pragma kernel KBuild
+#pragma kernel KReduce
+
+#define NUM_BINS 256u
+#define WEIGHT_SCALE 1024.0
+
+RWStructuredBuffer<uint>   _Histogram; // NUM_BINS log-luminance bins (weighted counts, fixed point)
+RWStructuredBuffer<float2> _Exposure;  // [0] = (adapted EV, adapted multiplier)
+Texture2D<float4>          _Source;    // HDR linear scene color (pre tonemap)
+
+float4 _SourceSize;     // (width, height, 1/width, 1/height)
+float2 _EvRange;        // (minEV, maxEV) mapped across the bins
+float4 _MeterParams;    // (centerX, centerY, innerRadius, outerRadius)
+float  _CenterBias;     // 0 = flat weight, 1 = full radial falloff
+float2 _Percent;        // (low, high) cumulative fractions of the metering window
+float4 _AdaptParams;    // (dt, speedUp, speedDown, resetFlag)
+float2 _ExposureLimits; // (minEV, maxEV) clamp on the target
+float  _ExposureComp;   // EV offset on the metered target
+float  _MiddleGrey;     // grey reference (~0.18)
+
+groupshared uint gsHist[NUM_BINS];
+
+[numthreads(64, 1, 1)]
+void KClear(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < NUM_BINS)
+        _Histogram[id.x] = 0u;
+}
+
+float MeterWeight(float2 uv)
+{
+    float aspect = _SourceSize.x * _SourceSize.w; // width / height
+    float2 d = uv - _MeterParams.xy;
+    d.x *= aspect;
+    float dist = length(d);
+    float inner = _MeterParams.z;
+    float outer = max(_MeterParams.w, inner + 1e-4);
+    float falloff = smoothstep(outer, inner, dist); // 1 at center, 0 outside outer
+    return lerp(1.0, falloff, _CenterBias);
+}
+
+[numthreads(16, 16, 1)]
+void KBuild(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    gsHist[gi] = 0u; // 256 threads, one bin each
+    GroupMemoryBarrierWithGroupSync();
+
+    uint w = (uint) _SourceSize.x;
+    uint h = (uint) _SourceSize.y;
+    if (id.x < w && id.y < h)
+    {
+        float2 uv = (float2(id.xy) + 0.5) * _SourceSize.zw;
+        float3 c = _Source.Load(int3((int) id.x, (int) id.y, 0)).rgb;
+        float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+        if (lum > 1e-5)
+        {
+            float ev = log2(lum);
+            float t = saturate((ev - _EvRange.x) / max(_EvRange.y - _EvRange.x, 1e-4));
+            uint bin = (uint) (t * 255.0 + 0.5);
+            float weight = MeterWeight(uv);
+            uint iw = (uint) (weight * WEIGHT_SCALE + 0.5);
+            if (iw > 0u)
+                InterlockedAdd(gsHist[bin], iw);
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    uint v = gsHist[gi];
+    if (v > 0u)
+        InterlockedAdd(_Histogram[gi], v);
+}
+
+[numthreads(1, 1, 1)]
+void KReduce(uint3 id : SV_DispatchThreadID)
+{
+    float total = 0.0;
+    for (uint k = 0u; k < NUM_BINS; k++)
+        total += (float) _Histogram[k];
+
+    float prevEv = _Exposure[0].x;
+    if (total <= 0.0)
+    {
+        _Exposure[0] = float2(prevEv, exp2(prevEv));
+        return;
+    }
+
+    float loCount = total * _Percent.x;
+    float hiCount = total * _Percent.y;
+    float acc = 0.0, sumEv = 0.0, sumW = 0.0;
+    for (uint b = 0u; b < NUM_BINS; b++)
+    {
+        float bw = (float) _Histogram[b];
+        float lo = acc;
+        float hi = acc + bw;
+        acc = hi;
+        float clipLo = max(lo, loCount);
+        float clipHi = min(hi, hiCount);
+        float frac = max(0.0, clipHi - clipLo);
+        if (frac > 0.0)
+        {
+            float binEv = lerp(_EvRange.x, _EvRange.y, (b + 0.5) / 256.0);
+            sumEv += binEv * frac;
+            sumW += frac;
+        }
+    }
+
+    float meanEv = (sumW > 0.0) ? (sumEv / sumW) : prevEv;
+    float targetEv = log2(_MiddleGrey) - meanEv + _ExposureComp;
+    targetEv = clamp(targetEv, _ExposureLimits.x, _ExposureLimits.y);
+
+    float dt = _AdaptParams.x;
+    float speed = (targetEv < prevEv) ? _AdaptParams.z : _AdaptParams.y;
+    float kAdapt = (_AdaptParams.w > 0.5) ? 1.0 : saturate(1.0 - exp(-dt * max(speed, 1e-4)));
+    float newEv = prevEv + (targetEv - prevEv) * kAdapt;
+    _Exposure[0] = float2(newEv, exp2(newEv));
+}
